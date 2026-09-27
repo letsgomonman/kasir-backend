@@ -389,3 +389,116 @@ app.post('/api/debts/:id/pay', async (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+// --- 7. ANALITIK GRAFIK OMZET & PRODUK TERLARIS ---
+
+// Endpoint untuk Grafik Omzet (7 Hari Terakhir & 30 Hari Terakhir)
+app.get('/api/analytics/sales-trend/:storeId', async (req, res) => {
+  const { storeId } = req.params;
+  const { range = '7days' } = req.query; // '7days' atau '30days'
+
+  try {
+    const days = range === '30days' ? 30 : 7;
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - (days - 1));
+    startDate.setHours(0, 0, 0, 0);
+
+    const { data: transactions, error } = await supabase
+      .from('transactions')
+      .select('total_harga, created_at')
+      .eq('store_id', storeId)
+      .gte('created_at', startDate.toISOString());
+
+    if (error) return res.status(400).json({ error: error.message });
+
+    // Grouping berdasarkan tanggal (YYYY-MM-DD)
+    const trendMap = {};
+    for (let i = 0; i < days; i++) {
+      const d = new Date(startDate);
+      d.setDate(d.getDate() + i);
+      const dateStr = d.toISOString().split('T')[0];
+      trendMap[dateStr] = 0;
+    }
+
+    transactions.forEach((tx) => {
+      const dateStr = new Date(tx.created_at).toISOString().split('T')[0];
+      if (trendMap[dateStr] !== undefined) {
+        trendMap[dateStr] += Number(tx.total_harga || 0);
+      }
+    });
+
+    const trendData = Object.keys(trendMap).map((date) => ({
+      date,
+      formattedDate: new Date(date).toLocaleDateString('id-ID', {
+        day: 'numeric',
+        month: 'short',
+      }),
+      omzet: trendMap[date],
+    }));
+
+    res.json(trendData);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Endpoint untuk Produk Terlaris (Top Selling)
+app.get('/api/analytics/top-products/:storeId', async (req, res) => {
+  const { storeId } = req.params;
+
+  try {
+    // 1. Ambil transaksi toko
+    const { data: txs, error: txErr } = await supabase
+      .from('transactions')
+      .select('id')
+      .eq('store_id', storeId);
+
+    if (txErr) return res.status(400).json({ error: txErr.message });
+    if (!txs || txs.length === 0) return res.json([]);
+
+    const txIds = txs.map((t) => t.id);
+
+    // 2. Ambil detail transaksi
+    const { data: details, error: detailErr } = await supabase
+      .from('transaction_details')
+      .select(`
+        product_id,
+        jumlah,
+        subtotal,
+        products ( nama_produk, kategori )
+      `)
+      .in('transaction_id', txIds);
+
+    if (detailErr) return res.status(400).json({ error: detailErr.message });
+
+    // 3. Agregasi total terjual per produk
+    const productMap = {};
+    details.forEach((item) => {
+      const pid = item.product_id;
+      const nama = item.products ? item.products.nama_produk : 'Produk Dihapus';
+      const kategori = item.products ? item.products.kategori : 'Umum';
+
+      if (!productMap[pid]) {
+        productMap[pid] = {
+          product_id: pid,
+          nama_produk: nama,
+          kategori: kategori,
+          total_terjual: 0,
+          total_pendapatan: 0,
+        };
+      }
+
+      productMap[pid].total_terjual += Number(item.jumlah || 0);
+      productMap[pid].total_pendapatan += Number(item.subtotal || 0);
+    });
+
+    // Sort berdasarkan jumlah terbanyak & ambil Top 5
+    const topProducts = Object.values(productMap)
+      .sort((a, b) => b.total_terjual - a.total_terjual)
+      .slice(0, 5);
+
+    res.json(topProducts);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
