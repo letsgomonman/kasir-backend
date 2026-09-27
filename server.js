@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import ExcelJS from 'exceljs';
 import { supabase } from './supabaseClient.js';
 
 dotenv.config();
@@ -103,56 +104,88 @@ app.delete('/api/products/:id', async (req, res) => {
   res.json({ message: 'Produk berhasil dihapus' });
 });
 
-// --- 4. TRANSAKSI KASIR (POS) & LAPORAN ---
+// --- 4. TRANSAKSI KASIR (POS), DISKON & KASBON ---
 
-// Simpan Transaksi Baru
+// Simpan Transaksi Baru (Mendukung Diskon, Kasbon/Nama Pelanggan, & Status)
 app.post('/api/transactions', async (req, res) => {
-  const { store_id, total_harga, bayar, kembalian, metode_pembayaran, items } = req.body;
+  const {
+    store_id,
+    total_harga,
+    diskon = 0,
+    bayar,
+    kembalian,
+    metode_pembayaran,
+    nama_pelanggan,
+    status_pembayaran = 'Lunas',
+    items,
+  } = req.body;
 
-  // 1. Simpan Header Transaksi (Menyimpan metode_pembayaran)
-  const { data: trans, error: transErr } = await supabase
-    .from('transactions')
-    .insert([
-      {
-        store_id,
-        total_harga,
-        bayar,
-        kembalian,
-        metode_pembayaran: metode_pembayaran || 'Tunai',
-      },
-    ])
-    .select()
-    .single();
+  try {
+    // 1. Simpan Header Transaksi
+    const { data: trans, error: transErr } = await supabase
+      .from('transactions')
+      .insert([
+        {
+          store_id,
+          total_harga,
+          diskon,
+          bayar,
+          kembalian,
+          metode_pembayaran: metode_pembayaran || 'Tunai',
+          nama_pelanggan: nama_pelanggan || null,
+          status_pembayaran: status_pembayaran || 'Lunas',
+        },
+      ])
+      .select()
+      .single();
 
-  if (transErr) return res.status(400).json({ error: transErr.message });
+    if (transErr) return res.status(400).json({ error: transErr.message });
 
-  // 2. Simpan Detail Transaksi & Update Stok
-  const details = items.map((item) => ({
-    transaction_id: trans.id,
-    product_id: item.product_id,
-    jumlah: item.jumlah,
-    harga_satuan: item.harga_satuan,
-    subtotal: item.subtotal,
-  }));
-
-  const { error: detailErr } = await supabase.from('transaction_details').insert(details);
-  if (detailErr) return res.status(400).json({ error: detailErr.message });
-
-  // Update stok produk
-  for (const item of items) {
-    const { data: prod } = await supabase.from('products').select('stok').eq('id', item.product_id).single();
-    if (prod) {
-      await supabase
-        .from('products')
-        .update({ stok: Math.max(0, prod.stok - item.jumlah) })
-        .eq('id', item.product_id);
+    // 2. Simpan Catatan Piutang jika status "Belum Lunas"
+    if (status_pembayaran === 'Belum Lunas' && nama_pelanggan) {
+      const sisaHutang = Math.max(0, total_harga - bayar);
+      const { error: debtErr } = await supabase.from('debts').insert([
+        {
+          store_id,
+          transaction_id: trans.id,
+          nama_pelanggan,
+          sisa_hutang: sisaHutang,
+        },
+      ]);
+      if (debtErr) console.error('Gagal mencatat kasbon:', debtErr.message);
     }
-  }
 
-  res.json({
-    message: 'Transaksi berhasil disimpan',
-    transaction: trans,
-  });
+    // 3. Simpan Detail Transaksi & Update Stok
+    const details = items.map((item) => ({
+      transaction_id: trans.id,
+      product_id: item.product_id,
+      jumlah: item.jumlah,
+      harga_satuan: item.harga_satuan,
+      subtotal: item.subtotal,
+    }));
+
+    const { error: detailErr } = await supabase.from('transaction_details').insert(details);
+    if (detailErr) return res.status(400).json({ error: detailErr.message });
+
+    // Update stok produk
+    for (const item of items) {
+      const { data: prod } = await supabase.from('products').select('stok').eq('id', item.product_id).single();
+      if (prod) {
+        await supabase
+          .from('products')
+          .update({ stok: Math.max(0, prod.stok - item.jumlah) })
+          .eq('id', item.product_id);
+      }
+    }
+
+    res.json({
+      message: 'Transaksi berhasil disimpan',
+      transaction: trans,
+    });
+  } catch (error) {
+    console.error('Error create transaction:', error);
+    res.status(500).json({ error: error.message || 'Gagal memproses transaksi' });
+  }
 });
 
 // Ambil Riwayat & Ringkasan Transaksi berdasarkan Toko
@@ -178,7 +211,7 @@ app.get('/api/transactions/store/:storeId', async (req, res) => {
   });
 });
 
-// GET /api/transactions/:id/items (BARU: Ambil Rincian Barang untuk Modal Detail Transaksi)
+// Ambil Rincian Barang untuk Modal Detail Transaksi
 app.get('/api/transactions/:id/items', async (req, res) => {
   const { id } = req.params;
 
@@ -207,9 +240,6 @@ app.get('/api/transactions/:id/items', async (req, res) => {
 
   res.json(formattedItems);
 });
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 // Hapus Riwayat Transaksi & Kembalikan Stok Barang (Restock)
 app.delete('/api/transactions/:id', async (req, res) => {
@@ -248,7 +278,7 @@ app.delete('/api/transactions/:id', async (req, res) => {
 
     if (detailDeleteErr) return res.status(400).json({ error: detailDeleteErr.message });
 
-    // 4. Hapus header transaksi
+    // 4. Hapus header transaksi (cascade ke debts jika dikonfigurasi)
     const { error: txDeleteErr } = await supabase
       .from('transactions')
       .delete()
@@ -262,3 +292,100 @@ app.delete('/api/transactions/:id', async (req, res) => {
     res.status(500).json({ error: error.message || 'Gagal menghapus transaksi' });
   }
 });
+
+// --- 5. EXPORT LAPORAN EXCEL (.xlsx) ---
+app.get('/api/transactions/export/excel/:storeId', async (req, res) => {
+  const { storeId } = req.params;
+
+  try {
+    const { data: transactions, error } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('store_id', storeId)
+      .order('created_at', { ascending: false });
+
+    if (error) return res.status(400).json({ error: error.message });
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Laporan Penjualan');
+
+    worksheet.columns = [
+      { header: 'ID Transaksi', key: 'id', width: 25 },
+      { header: 'Tanggal', key: 'created_at', width: 20 },
+      { header: 'Pelanggan', key: 'nama_pelanggan', width: 20 },
+      { header: 'Metode', key: 'metode_pembayaran', width: 15 },
+      { header: 'Status', key: 'status_pembayaran', width: 15 },
+      { header: 'Diskon (Rp)', key: 'diskon', width: 15 },
+      { header: 'Total (Rp)', key: 'total_harga', width: 18 },
+      { header: 'Bayar (Rp)', key: 'bayar', width: 18 },
+      { header: 'Kembalian (Rp)', key: 'kembalian', width: 18 },
+    ];
+
+    transactions.forEach((tx) => {
+      worksheet.addRow({
+        id: tx.id,
+        created_at: new Date(tx.created_at).toLocaleString('id-ID'),
+        nama_pelanggan: tx.nama_pelanggan || 'Umum',
+        metode_pembayaran: tx.metode_pembayaran || 'Tunai',
+        status_pembayaran: tx.status_pembayaran || 'Lunas',
+        diskon: Number(tx.diskon || 0),
+        total_harga: Number(tx.total_harga || 0),
+        bayar: Number(tx.bayar || 0),
+        kembalian: Number(tx.kembalian || 0),
+      });
+    });
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename=' + `Laporan_Penjualan_${storeId}.xlsx`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error('Error export excel:', err);
+    res.status(500).json({ error: err.message || 'Gagal mengekspor laporan Excel' });
+  }
+});
+
+// --- 6. MANAGEMENT KASBON / PIUTANG PELANGGAN ---
+
+// Ambil daftar piutang toko yang belum lunas
+app.get('/api/debts/store/:storeId', async (req, res) => {
+  const { storeId } = req.params;
+  const { data, error } = await supabase
+    .from('debts')
+    .select('*')
+    .eq('store_id', storeId)
+    .gt('sisa_hutang', 0);
+
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data);
+});
+
+// Pelunasan / Cicilan Kasbon
+app.post('/api/debts/:id/pay', async (req, res) => {
+  const { id } = req.params;
+  const { jumlah_bayar } = req.body;
+
+  const { data: debt, error: fetchErr } = await supabase.from('debts').select('*').eq('id', id).single();
+  if (fetchErr || !debt) return res.status(404).json({ error: 'Data kasbon tidak ditemukan' });
+
+  const sisaBaru = Math.max(0, debt.sisa_hutang - jumlah_bayar);
+  const { error: updateErr } = await supabase.from('debts').update({ sisa_hutang: sisaBaru }).eq('id', id);
+
+  if (updateErr) return res.status(400).json({ error: updateErr.message });
+
+  if (sisaBaru === 0 && debt.transaction_id) {
+    await supabase.from('transactions').update({ status_pembayaran: 'Lunas' }).eq('id', debt.transaction_id);
+  }
+
+  res.json({ message: 'Pembayaran kasbon berhasil dicatat', sisa_hutang: sisaBaru });
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
