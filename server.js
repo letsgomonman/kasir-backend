@@ -110,6 +110,7 @@ app.delete('/api/products/:id', async (req, res) => {
 app.post('/api/transactions', async (req, res) => {
   const {
     store_id,
+    customer_id,
     total_harga,
     diskon = 0,
     bayar,
@@ -121,18 +122,24 @@ app.post('/api/transactions', async (req, res) => {
   } = req.body;
 
   try {
+    const numTotal = Number(total_harga || 0);
+    const numBayar = Number(bayar || 0);
+    const numDiskon = Number(diskon || 0);
+    const numKembalian = Number(kembalian || 0);
+
     // 1. Simpan Header Transaksi
     const { data: trans, error: transErr } = await supabase
       .from('transactions')
       .insert([
         {
           store_id,
-          total_harga,
-          diskon,
-          bayar,
-          kembalian,
+          customer_id: customer_id || null,
+          total_harga: numTotal,
+          diskon: numDiskon,
+          bayar: numBayar,
+          kembalian: numKembalian,
           metode_pembayaran: metode_pembayaran || 'Tunai',
-          nama_pelanggan: nama_pelanggan || null,
+          nama_pelanggan: nama_pelanggan || 'Umum',
           status_pembayaran: status_pembayaran || 'Lunas',
         },
       ])
@@ -143,7 +150,7 @@ app.post('/api/transactions', async (req, res) => {
 
     // 2. Simpan Catatan Piutang jika status "Belum Lunas"
     if (status_pembayaran === 'Belum Lunas' && nama_pelanggan) {
-      const sisaHutang = Math.max(0, total_harga - bayar);
+      const sisaHutang = Math.max(0, numTotal - numBayar);
       const { error: debtErr } = await supabase.from('debts').insert([
         {
           store_id,
@@ -155,26 +162,50 @@ app.post('/api/transactions', async (req, res) => {
       if (debtErr) console.error('Gagal mencatat kasbon:', debtErr.message);
     }
 
-    // 3. Simpan Detail Transaksi & Update Stok
-    const details = items.map((item) => ({
-      transaction_id: trans.id,
-      product_id: item.product_id,
-      jumlah: item.jumlah,
-      harga_satuan: item.harga_satuan,
-      subtotal: item.subtotal,
-    }));
+    // 3. Update Poin Pelanggan
+    if (customer_id) {
+      const earnedPoints = Math.floor(numTotal / 10000);
 
-    const { error: detailErr } = await supabase.from('transaction_details').insert(details);
-    if (detailErr) return res.status(400).json({ error: detailErr.message });
+      const { data: cust } = await supabase
+        .from('customers')
+        .select('poin, total_belanja')
+        .eq('id', customer_id)
+        .single();
 
-    // Update stok produk
-    for (const item of items) {
-      const { data: prod } = await supabase.from('products').select('stok').eq('id', item.product_id).single();
-      if (prod) {
+      if (cust) {
         await supabase
-          .from('products')
-          .update({ stok: Math.max(0, prod.stok - item.jumlah) })
-          .eq('id', item.product_id);
+          .from('customers')
+          .update({
+            poin: Number(cust.poin || 0) + earnedPoints,
+            total_belanja: Number(cust.total_belanja || 0) + numTotal,
+          })
+          .eq('id', customer_id);
+      }
+    }
+
+    // 4. Simpan Detail Transaksi & Update Stok
+    if (items && items.length > 0) {
+      const details = items.map((item) => ({
+        transaction_id: trans.id,
+        product_id: item.product_id,
+        nama_produk: item.nama_produk,
+        jumlah: Number(item.jumlah),
+        harga_satuan: Number(item.harga_satuan),
+        subtotal: Number(item.subtotal),
+      }));
+
+      const { error: detailErr } = await supabase.from('transaction_details').insert(details);
+      if (detailErr) return res.status(400).json({ error: detailErr.message });
+
+      // Update stok produk
+      for (const item of items) {
+        const { data: prod } = await supabase.from('products').select('stok').eq('id', item.product_id).single();
+        if (prod) {
+          await supabase
+            .from('products')
+            .update({ stok: Math.max(0, prod.stok - Number(item.jumlah)) })
+            .eq('id', item.product_id);
+        }
       }
     }
 
@@ -498,6 +529,44 @@ app.get('/api/analytics/top-products/:storeId', async (req, res) => {
       .slice(0, 5);
 
     res.json(topProducts);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- ENDPOINT MASTER PELANGGAN & LOYALTY ---
+
+// GET Daftar Pelanggan per Toko
+app.get('/api/customers/store/:storeId', async (req, res) => {
+  const { storeId } = req.params;
+  try {
+    const { data, error } = await supabase
+      .from('customers')
+      .select('*')
+      .eq('store_id', storeId)
+      .order('nama', { ascending: true });
+
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST Tambah Pelanggan Baru
+app.post('/api/customers', async (req, res) => {
+  const { store_id, nama, no_telepon } = req.body;
+  if (!store_id || !nama) return res.status(400).json({ error: 'Store ID dan Nama wajib diisi' });
+
+  try {
+    const { data, error } = await supabase
+      .from('customers')
+      .insert([{ store_id, nama, no_telepon, poin: 0, total_belanja: 0 }])
+      .select()
+      .single();
+
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
